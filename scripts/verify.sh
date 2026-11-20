@@ -56,6 +56,24 @@ echo "=== savings ==="
 rtk gain 2>&1 | grep -E "Tokens saved" | head -n 1
 headroom savings 2>&1 | grep -iE "opencode" | head -n 1
 
+echo "=== docs ==="
+if [ -f README.md ]; then
+  anchor_fail=$(node -e "
+const fs=require('fs');
+const md=fs.readFileSync('README.md','utf8');
+const slug=(t)=>t.toLowerCase().replace(/[^\w\s-]/g,'').trim().replace(/ /g,'-');
+const heads=new Set([...md.matchAll(/^#{1,6} (.+)\$/gm)].map(m=>slug(m[1])));
+const links=[...new Set([...md.matchAll(/\]\(#([^)]+)\)/g)].map(m=>m[1]))];
+const missing=links.filter(l=>!heads.has(l));
+if(missing.length){console.log(missing.join(' '));process.exit(1)}
+")
+  if [ -z "$anchor_fail" ]; then
+    ok "all README anchors resolve"
+  else
+    bad "broken README anchors: $anchor_fail"
+  fi
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "all checks passed"

@@ -26,13 +26,15 @@ diagnostics, and the settings that turned out to be load-bearing.
 6. [Step 4 — Configure the OpenCode provider](#6-step-4--configure-the-opencode-provider)
 7. [Step 5 — Install plugins and skills](#7-step-5--install-plugins-and-skills)
 8. [Step 6 — Register the MCP servers](#8-step-6--register-the-mcp-servers)
-9. [Step 7 — The RTK after-tool hook](#9-step-7--the-rtk-after-tool-hook-the-part-that-actually-saves-tokens)
+9. [Step 7 — The RTK after-tool hook](#9-step-7--the-rtk-after-tool-hook)
 10. [Step 8 — The REA model guard](#10-step-8--the-rea-model-guard)
 11. [Step 9 — Obsidian vault and workspace docs](#11-step-9--obsidian-vault-and-workspace-docs)
 12. [Step 10 — Porting the vibe-coding-toolkit](#12-step-10--porting-the-vibe-coding-toolkit)
 13. [Verification](#13-verification)
 14. [Troubleshooting](#14-troubleshooting)
 15. [Complete file reference](#15-complete-file-reference)
+16. [Every issue we hit, and its fix](#16-every-issue-we-hit-and-its-fix)
+17. [Complete issue index](#17-complete-issue-index)
 
 ---
 
@@ -1426,6 +1428,367 @@ and update every MCP entry that referenced the old path.
 | Headroom savings (OpenCode) | 11,019 tokens over 36 calls |
 | Headroom on large Bash output | ~15% |
 | REA tools available | 255 (plus 6 prompts) |
+
+---
+
+## 16. Every issue we hit, and its fix
+
+Chronological. Each entry is a symptom you can recognise, the cause, and the fix.
+
+### 16.1 Shell tool calls randomly failing to parse
+
+**Symptom**
+
+```text
+The tool input could not be parsed as JSON, so the call was not executed.
+Invalid arguments for tool "shell": command: Missing key
+```
+
+**Cause.** The command string carried nested quotes, `\"` escapes, backslashes, a heredoc
+(`<<`), `$(...)` substitution, or backticks. The harness drops or truncates those payloads.
+Nothing was wrong with the command's intent.
+
+**Fix.** Never retry with more escaping — that is what triggers it. Write the command to a
+script file and run it:
+
+```sh
+# via the patch tool: *** Add File: /tmp/job.sh
+sh /tmp/job.sh
+```
+
+Same rule for `ctx_execute` with `language: "shell"` — its `code` field is still a shell
+command string.
+
+**Prevention.** Put this in `AGENTS.md` so every agent and subagent inherits it:
+
+```markdown
+## Shell and output hygiene
+- Keep shell commands short and simple. No heredocs. No multi-line `node -e` with nested quotes.
+- For complex commands, write a script file with the write/patch tool, then run `sh /path/to/script.sh`.
+- For output over roughly 20 lines, use `ctx_execute` with an `intent`, then `ctx_search` for the part that matters.
+- Batch independent checks with `ctx_batch({commands, queries})`.
+- Pass this guidance to every subagent before it starts shell work.
+```
+
+### 16.2 `rtk-proxy` saved nothing
+
+**Symptom.** `rtk-proxy stats` reported `tokens saved: 0` across every request, while the
+chain otherwise worked.
+
+**Cause.** Two separate things.
+
+1. No pipeline file existed, so the daemon ran `rtk:default` and logged
+   `no cache-breakpoint or CCR rules — running category-A normalisation only`.
+2. Even with the pipeline fixed, the proxy **cannot** run the real compression method.
+   `term` keeps the original only in a recall copy the proxy cannot store, so RTK skips it
+   at the proxy layer (warning `W016`).
+
+**Fix.** Part one — the pipeline file:
+
+```toml
+schema_version = 1
+
+[pipeline]
+extends = ["rtk:posthook", "rtk:proxy"]
+```
+
+Part two — the agent-side hook in [Step 7](#9-step-7--the-rtk-after-tool-hook).
+The proxy alone will never compress; the hook is where the saving happens.
+
+### 16.3 `rtk-proxy config set` reported success and changed nothing
+
+**Symptom**
+
+```text
+$ rtk-proxy config set openai_upstream https://example.com/v1
+openai_upstream = https://example.com/v1
+$ rtk-proxy config get openai_upstream
+https://api.openai.com
+```
+
+**Cause.** The admin write endpoint acknowledges the request but does not persist the value.
+
+**Fix.** Edit `~/Library/Application Support/rtk-proxy/rtk-proxy.toml` directly, or set
+`RTK_PROXY_OPENAI_UPSTREAM` / `RTK_PROXY_ANTHROPIC_UPSTREAM` in the environment before
+starting the daemon.
+
+### 16.4 The RTK after-hook silently did nothing
+
+**Symptom.** The hook was registered, the payload looked right, and no output was compressed.
+No error anywhere.
+
+**Causes, in the order we found them.**
+
+1. **A syntax error in the plugin.** An orphaned doc comment left by a bad edit made the
+   plugin fail to load. OpenCode reported nothing.
+   ```sh
+   cp ~/.config/opencode/plugins/rtk.ts /tmp/rtk-check.mts
+   node --input-type=module -e "import('/tmp/rtk-check.mts').then(()=>console.log('OK')).catch(e=>console.log('ERR',e.message))"
+   ```
+2. **Wrong output path.** OpenCode's shell tool reports
+   `{exitCode, output, wallTimeSeconds}`. The text is at `result.output.output`, **not**
+   `result.output.stdout`. Reading `.stdout` gives `undefined` and the handler returns.
+3. **Missing `tool_input.command`** in the payload sent to `rtk hook claude`. Without it the
+   hook returns empty.
+4. **The tool name was `shell`, not `Bash`.** `rtk hook claude` keys off Claude Code's tool
+   names, so the plugin must map `shell` to `Bash` before building the payload.
+5. **Output under 512 bytes** — RTK's `min_size` guard.
+6. **The command had been rewritten by RTK itself.** `is_rtk_command = false` means RTK
+   skips compressing its own output, by design.
+7. **A stale server.** The background `opencode serve --service` caches the loaded plugin.
+
+**How it was actually found.** A throwaway probe plugin that dumped
+`Object.keys(event)` to a file, which revealed the real payload shape:
+
+```text
+after {"tool":"shell","status":"completed","outputType":"string","outputLen":51374}
+```
+
+### 16.5 Headroom compressed nothing
+
+**Symptom.** Everything healthy — `headroom doctor` passed, `kompress` reported
+`ready (onnx)`, requests succeeded — but the token count never dropped.
+
+**Cause.** Tool-result interception is opt-in and gated behind a rollout channel. Both parts
+are required.
+
+**Fix.**
+
+```bash
+export HEADROOM_ROLLOUT_CHANNEL=canary
+```
+
+```json
+"proxy_args": ["--intercept-tool-results", "..."]
+```
+
+**Verify.**
+
+```sh
+headroom rollout status
+# tool_result_interceptors: enabled=true decision=rollout_channel
+
+grep -i router ~/.headroom/logs/proxy-8787.log | tail -n 3
+# compressed=1   <- was compressed=0
+```
+
+### 16.6 Repointing Headroom broke Claude Code
+
+**Symptom.** After changing Headroom's upstream to serve OpenCode, Claude Code started
+failing:
+
+```text
+Error: Incorrect API key provided: sk-...5060.
+```
+
+**Cause.** Headroom is a **shared** proxy. Claude Code was already routed through it with a
+different provider's key. Changing the upstream changed it for every client.
+
+**Fix.** Do not move a shared proxy between providers. Either restore the upstream that
+client expects, or run two Headroom instances on two ports using separate deployment
+profiles:
+
+```sh
+headroom deploy --profile openai  --port 8788 --providers manual --target opencode
+headroom deploy --profile default --port 8787 --providers manual --target claude
+```
+
+**Prevent.** Audit who points at the proxy before changing it:
+
+```sh
+grep -r "127.0.0.1:8787" ~/.claude ~/.config/opencode 2>/dev/null
+```
+
+### 16.7 The manifest silently overrode the run script
+
+**Symptom.** Edited `run-headroom.sh` to point at rtk-proxy, reloaded the service, and
+`/readyz` still reported the old upstream.
+
+**Cause.** `base_env` in `~/.headroom/deploy/default/manifest.json` takes precedence over the
+script's `export` statements.
+
+**Fix.** Edit both. Then reload:
+
+```sh
+launchctl bootout gui/$(id -u)/com.headroom.default
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.headroom.default.plist
+sleep 8
+curl -s http://127.0.0.1:8787/readyz | grep -o '"url":"[^"]*"'
+```
+
+### 16.8 MCP servers failed with `NotFound: ChildProcess.spawn`
+
+**Symptom**
+
+```text
+x rea        failed: NotFound: ChildProcess.spawn (rea mcp)
+x playwright failed: NotFound: ChildProcess.spawn (playwright-mcp )
+```
+
+**Cause.** The binaries existed and worked from the shell. The OpenCode server's `PATH`
+does not include the fnm-managed Node bin directory.
+
+**Fix.** Absolute paths in every MCP `command`:
+
+```json
+"command": ["/Users/<you>/.local/share/fnm/node-versions/24.22.3/installation/bin/rea", "mcp"]
+```
+
+Re-resolve after any Node upgrade — fnm changes the version segment.
+
+### 16.9 `rtk pipeline explain` showed no rules for OpenCode
+
+**Symptom.**
+
+```text
+$ rtk pipeline explain --agent opencode --tool Bash --command "ls"
+hook.after_tool.any: no rule matches these facts — output passes through
+```
+
+**Cause.** Not a bug. The pipeline resolves rules by agent name and RTK does not know
+`opencode`.
+
+**Fix.** Inspect with `--agent claude-code`.
+
+### 16.10 The model guard blocked everything, including allowed models
+
+**Symptom.** REA was blocked even on a model that should have been allowed.
+
+**Cause.** The first guard version hardcoded a provider list, so any model not on it was
+treated as banned.
+
+**Fix.** Ban by **model id pattern**, allow everything else, and resolve the real session
+model server-side:
+
+```ts
+const session = await ctx.session.get({ sessionID })
+const modelID = String(session?.model?.id ?? "")
+```
+
+And fail **closed** — if the model cannot be resolved, block the call:
+
+```ts
+} catch {
+  throw new Error(`[rea-guard] blocked ${tool}: could not resolve the session model.`)
+}
+```
+
+### 16.11 The 26-file upstream mirror gap
+
+**Symptom.** A catalog of the upstream toolkit found 122 files. The local mirror had 96.
+
+**Cause.** The first catalog was built from the local mirror instead of from GitHub, so it
+inherited the mirror's blind spots. The missing 26 were the files a glob-based sync skips:
+root READMEs (en/es/pt-BR), `LICENSE`, `CLAUDE.md`, `.gitignore`,
+`.github/workflows/validate.yml`, `templates/README.md`,
+`templates/environment-manifest.json.example`, `templates/product.md.template`, 5
+`project-docs/*.md.template` files, and 10 SVG assets.
+
+**Fix.** Always diff against live ground truth, never against a local copy:
+
+```sh
+curl -s -H "User-Agent: opencode" \
+  "https://api.github.com/repos/OWNER/REPO/git/trees/main?recursive=1" -o /tmp/gt.json
+```
+
+And check `truncated` in the response — the trees API truncates on large repos.
+
+**Prevention.** Cross-check with more than one model. Three independent catalogs agreed on
+122 and found the same 26 missing; a catalog built from the local mirror was the only
+outlier. See [12.3](#123-cross-check-the-port-with-more-than-one-model).
+
+### 16.12 `npm update -g` removed globally installed packages
+
+**Symptom.** A package that was installed and working disappeared after an npm upgrade.
+
+**Cause.** `npm update -g` updates packages npm knows about and can remove ones it does not.
+
+**Fix.** Use `npm install -g <pkg>@latest` for each package. Verify afterwards:
+
+```sh
+npm list -g --depth=0
+```
+
+### 16.13 Frida's install script was blocked by npm
+
+**Symptom.** `npm install -g rea-agents` warned:
+
+```text
+npm warn install-scripts  1 package has install scripts not yet covered by allowScripts:
+npm warn install-scripts   frida@17.23.2 (install: node scripts/install.js)
+```
+
+**Cause.** npm's default is to not run install scripts. Frida's script downloads the native
+binaries.
+
+**Fix.** Only if REA's dynamic instrumentation is needed:
+
+```sh
+npm install -g --allow-scripts=frida rea-agents@latest
+```
+
+### 16.14 Provider limits were silently capped
+
+**Symptom.** A model with a 1M context window behaved as if it had 200k.
+
+**Cause.** Custom providers fall back to 200k context / 32k output unless each model
+declares its own `limit`.
+
+**Fix.** Declare `limit` per model in `opencode.json`, sourced from models.dev.
+
+### 16.15 The plugin was edited but the running server kept the old code
+
+**Symptom.** A plugin edit had no effect. `opencode run` behaved as before.
+
+**Cause.** The background `opencode serve --service` caches loaded plugins.
+
+**Fix.** `/reload` in the TUI, or test against a fresh server:
+
+```sh
+opencode run --standalone --model kpa/gpt-5-6-luna "..."
+```
+
+### 16.16 `gh` was not the only path to GitHub
+
+**Symptom.** Repository work drifted toward raw `curl` calls to `api.github.com`.
+
+**Fix.** A standing rule in `AGENTS.md`:
+
+```markdown
+Use `gh` for every GitHub call (`gh repo clone`, `gh api`, `gh pr`, `gh issue`).
+Never call the GitHub REST API directly with `curl`.
+```
+
+`gh` is already authenticated, so it also removes the need to handle tokens by hand:
+
+```sh
+gh auth status
+gh repo clone OWNER/REPO ./local-dir
+gh api "repos/OWNER/REPO/git/trees/main?recursive=1" --jq '.tree[].path'
+```
+
+---
+
+## 17. Complete issue index
+
+| # | Symptom | Root cause | Fix | Where |
+|---|---|---|---|---|
+| 1 | Shell call fails to parse JSON | nested quotes, escapes, heredoc, `$()` | script file, then `sh file` | [16.1](#161-shell-tool-calls-randomly-failing-to-parse) |
+| 2 | `rtk-proxy` saves 0 tokens | no pipeline file + proxy cannot reach `hook.after_tool` | `pipeline.toml` + agent-side hook | [16.2](#162-rtk-proxy-saved-nothing) |
+| 3 | `config set` does not persist | admin write is not durable | edit the toml, or use env vars | [16.3](#163-rtk-proxy-config-set-reported-success-and-changed-nothing) |
+| 4 | RTK after-hook silent | syntax error / wrong path / missing command / wrong tool name / <512 B / stale server | 7 checks, listed in place | [16.4](#164-the-rtk-after-hook-silently-did-nothing) |
+| 5 | Headroom saves nothing | interceptors need canary channel **and** the flag | both | [16.5](#165-headroom-compressed-nothing) |
+| 6 | Client gets "Incorrect API key" | shared proxy's upstream was repointed | restore, or two profiles on two ports | [16.6](#166-repointing-headroom-broke-claude-code) |
+| 7 | Headroom upstream unchanged | manifest `base_env` beats the script | edit both, reload launchd | [16.7](#167-the-manifest-silently-overrode-the-run-script) |
+| 8 | MCP `NotFound: spawn` | server PATH lacks the fnm bin dir | absolute paths | [16.8](#168-mcp-servers-failed-with-notfound-childprocessspawn) |
+| 9 | `pipeline explain` shows nothing | agent name unknown to RTK | use `--agent claude-code` | [16.9](#169-rtk-pipeline-explain-showed-no-rules-for-opencode) |
+| 10 | Guard blocks allowed models | provider allowlist instead of id patterns | ban by pattern, resolve real model, fail closed | [16.10](#1610-the-model-guard-blocked-everything-including-allowed-models) |
+| 11 | 26 upstream files missing | catalog built from the local mirror | diff against live ground truth | [16.11](#1611-the-26-file-upstream-mirror-gap) |
+| 12 | npm package disappeared | `npm update -g` removed it | `npm install -g pkg@latest`, verify | [16.12](#1612-npm-update--g-removed-globally-installed-packages) |
+| 13 | Frida install script skipped | npm blocks install scripts by default | `--allow-scripts=frida` | [16.13](#1613-fridas-install-script-was-blocked-by-npm) |
+| 14 | Model capped at 200k | no `limit` declared | declare per model | [16.14](#1614-provider-limits-were-silently-capped) |
+| 15 | Plugin edit ignored | server caches plugins | `/reload` or `--standalone` | [16.15](#1615-the-plugin-was-edited-but-the-running-server-kept-the-old-code) |
+| 16 | GitHub calls drifting to curl | no standing rule | `gh` for everything | [16.16](#1616-gh-was-not-the-only-path-to-github) |
 
 ---
 
