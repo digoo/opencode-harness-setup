@@ -411,6 +411,81 @@ Rollout channel: canary
   tool_result_interceptors: enabled=true decision=rollout_channel
 ```
 
+> ### Pitfall: Headroom compresses nothing without the flag
+>
+> The symptom is subtle: everything looks healthy, `headroom doctor` passes, `kompress` reports
+> `ready (onnx)`, and the proxy answers every request — but the token count never drops.
+>
+> The log shows why:
+>
+> ```text
+> [router] route_counts={'excluded_tool': 1} compressed=0 frozen=2 msgs=3
+> [router] route_counts={'ratio_too_high': 1, 'cache_miss': 1} compressed=0 frozen=976 msgs=977
+> ```
+>
+> `compressed=0` on every request. Two separate causes, both required:
+>
+> 1. **The rollout channel.** Tool-result interceptors are gated behind
+>    `HEADROOM_ROLLOUT_CHANNEL=canary` (or `dev`). Without it:
+>    ```text
+> Rollout channel: stable
+>   tool_result_interceptors: enabled=false decision=not_requested
+> ```
+> 2. **The flag.** `--intercept-tool-results` must be in `proxy_args` in the manifest.
+>    It is rejected at startup without the channel:
+>    ```text
+> --intercept-tool-results  Opt in to tool_result interceptors.
+>                          Requires HEADROOM_ROLLOUT_CHANNEL=canary (or dev).
+> ```
+>
+> Fix both, then reload the launchd agent and confirm `compressed=1` appears in the log.
+
+> ### Pitfall: pointing Headroom at the wrong provider breaks the other client
+>
+> Headroom is a **shared** proxy. Changing its upstream to serve OpenCode also changes the
+> upstream for every client that already pointed at Headroom.
+>
+> In this setup Claude Code was already routed through Headroom to a Kimi endpoint with a
+> Kimi key. Repointing Headroom at the OpenAI-compatible provider broke Claude Code
+> immediately, because the Kimi key was rejected by the new upstream:
+>
+> ```text
+> Error: Incorrect API key provided: sk-...5060.
+> You can find your API key at https://platform.openai.com/account/api-keys.
+> ```
+>
+> The mistake was changing Headroom's upstream in place. The correct approach is to keep
+> Headroom pointed at whatever provider its clients expect, and let each client decide where
+> *it* points. If you need two different upstreams, run **two** Headroom instances on
+> different ports — one per provider — instead of moving a shared one.
+>
+> When you do change it, audit every client that uses it before restarting:
+>
+> ```sh
+> grep -r "127.0.0.1:8787" ~/.claude ~/.config/opencode 2>/dev/null
+> ```
+
+### 5.4.1 Two providers, two Headroom instances
+
+If two clients need different upstreams, give each its own Headroom. The deployment profile
+name is what keeps them apart:
+
+```sh
+# profile "openai" -> port 8788
+headroom deploy --profile openai --port 8788 --providers manual --target opencode
+
+# profile "default" -> port 8787
+headroom deploy --profile default --port 8787 --providers manual --target claude
+```
+
+Each profile gets its own directory (`~/.headroom/deploy/<profile>/`), its own launchd plist
+(`com.headroom.<profile>`), and its own `base_env`. Then point each client at its own port:
+
+```text
+OpenCode   -> http://127.0.0.1:8080/v1        (rtk-proxy only, no Headroom)
+Claude Code-> http://127.0.0.1:8787           (Headroom profile "default")
+```
+
 ### 5.5 What Headroom will and will not compress
 
 `Read`, `Glob`, `Grep`, `Write`, `Edit`, `WebSearch`, `WebFetch` are **excluded by design**:
@@ -1240,6 +1315,35 @@ agent:
 launchctl bootout gui/$(id -u)/com.headroom.default
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.headroom.default.plist
 ```
+
+### Headroom is healthy but saves nothing
+
+Check the router counters in the log:
+
+```sh
+grep -i "router" ~/.headroom/logs/proxy-8787.log | tail -n 5
+```
+
+```text
+[router] route_counts={'excluded_tool': 1} compressed=0 frozen=2 msgs=3
+```
+
+`compressed=0` means the interceptors never ran. Two causes, both must be fixed:
+
+1. `HEADROOM_ROLLOUT_CHANNEL=canary` is not set in the run script, the ensure script,
+   **and** the manifest `base_env`.
+2. `--intercept-tool-results` is missing from `proxy_args` in the manifest.
+
+```sh
+headroom rollout status
+# tool_result_interceptors: enabled=true decision=rollout_channel
+```
+
+### A client started returning "Incorrect API key provided"
+
+You changed a shared proxy's upstream. Headroom serves every client that points at it.
+Restore the upstream that client expects, or give each provider its own Headroom instance
+on its own port (see 5.4.1).
 
 ### Shell tool calls fail to parse
 
