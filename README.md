@@ -525,6 +525,20 @@ curl -s http://127.0.0.1:8787/v1/chat/completions -H "Authorization: Bearer $KEY
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "read": {
+      "~/.config/opencode/get-shit-done/*": "allow"
+    },
+    "external_directory": {
+      "~/.config/opencode/get-shit-done/*": "allow"
+    }
+  },
+  "plugin": [
+    "superpowers@git+https://github.com/obra/superpowers.git",
+    "/opt/homebrew/lib/node_modules/context-mode",
+    "./plugins/caveman",
+    "./plugins/rea-guard"
+  ],
   "provider": {
     "kpa": {
       "name": "KPA",
@@ -541,6 +555,55 @@ curl -s http://127.0.0.1:8787/v1/chat/completions -H "Authorization: Bearer $KEY
           "limit": { "context": 1050000, "input": 922000, "output": 128000 }
         }
       }
+    }
+  },
+  "mcp": {
+    "supabase": {
+      "type": "remote",
+      "url": "https://mcp.supabase.com/mcp?project_ref=<ref>",
+      "enabled": true
+    },
+    "serena": {
+      "type": "local",
+      "command": [
+        "uvx", "--from", "git+https://github.com/oraios/serena",
+        "serena", "start-mcp-server", "--context", "ide-assistant", "--project-from-cwd"
+      ],
+      "environment": { "PYTHONUNBUFFERED": "1" }
+    },
+    "servers": {
+      "context7": {
+        "type": "remote",
+        "url": "https://mcp.context7.com/mcp"
+      },
+      "rea": {
+        "type": "local",
+        "command": [
+          "/Users/<you>/.local/share/fnm/node-versions/v24.22.3/installation/bin/rea",
+          "mcp"
+        ],
+        "disabled": false
+      }
+    },
+    "context-mode": {
+      "type": "local",
+      "command": [
+        "/opt/homebrew/opt/node/bin/node",
+        "/opt/homebrew/lib/node_modules/context-mode/server.mjs",
+        "--agent", "opencode"
+      ],
+      "enabled": true
+    },
+    "codebase-memory-mcp": {
+      "command": ["/Users/<you>/.local/bin/codebase-memory-mcp"],
+      "type": "local"
+    },
+    "playwright": {
+      "type": "local",
+      "command": [
+        "/Users/<you>/.local/share/fnm/node-versions/v24.22.3/installation/bin/playwright-mcp"
+      ],
+      "enabled": true
     }
   },
   "compaction": {
@@ -587,6 +650,15 @@ Reference with `{file:...}` so the key never appears in the config file:
 "apiKey": "{file:~/.config/opencode/secrets/provider-gpt.key}"
 ```
 
+> If your existing config still references `kpalabz-gpt.key` or `kpalabz-claude.key`,
+> rename the files and update the `{file:...}` references to match.
+
+> ### The `permission` block
+>
+> Without it, OpenCode's TUI blocks every read of the `get-shit-done` directory
+> (`~/.config/opencode/get-shit-done/*`) with a confirmation prompt. The `read` and
+> `external_directory` entries above pre-approve both. See [Step 10](#12-step-10--porting-the-vibe-coding-toolkit) for what lives in that directory.
+
 ---
 
 ## 7. Step 5 — Install plugins and skills
@@ -606,6 +678,12 @@ Reference with `{file:...}` so the key never appears in the config file:
 opencode plugin list
 opencode plugin check
 ```
+
+`superpowers` installs the `get-shit-done` framework into `~/.config/opencode/get-shit-done/`:
+30+ `gsd-*` subagent definitions (`gsd-code-reviewer`, `gsd-debugger`, `gsd-executor`, …),
+templates for research, UI specs, and verification reports, and the `gsd-tools.cjs` CLI
+for git commits and intel updates. The `permission` block in `opencode.json` is what lets
+the agent read those templates without prompting.
 
 ### 7.2 RTK's own OpenCode plugin
 
@@ -703,7 +781,7 @@ Global skills live in `~/.config/opencode/skills/`. The main ones used here:
     "rea": {
       "type": "local",
       "command": [
-        "/Users/<you>/.local/share/fnm/node-versions/24.22.3/installation/bin/rea",
+        "/Users/<you>/.local/share/fnm/node-versions/v24.22.3/installation/bin/rea",
         "mcp"
       ],
       "disabled": false
@@ -712,7 +790,7 @@ Global skills live in `~/.config/opencode/skills/`. The main ones used here:
   "playwright": {
     "type": "local",
     "command": [
-      "/Users/<you>/.local/share/fnm/node-versions/24.22.3/installation/bin/playwright-mcp"
+      "/Users/<you>/.local/share/fnm/node-versions/v24.22.3/installation/bin/playwright-mcp"
     ],
     "enabled": true
   }
@@ -732,7 +810,7 @@ include the fnm bin directory. Resolve it once:
 
 ```sh
 npm root -g
-ls -d ~/.local/share/fnm/node-versions/*/installation/bin
+ls -d ~/.local/share/fnm/node-versions/v*/installation/bin
 ```
 
 > If you upgrade Node through fnm, the version segment changes and every MCP pointing at
@@ -1370,7 +1448,7 @@ shell command string.
 fnm changes the version directory. Re-resolve the MCP paths:
 
 ```sh
-ls -d ~/.local/share/fnm/node-versions/*/installation/bin
+ls -d ~/.local/share/fnm/node-versions/v*/installation/bin
 ```
 
 and update every MCP entry that referenced the old path.
@@ -1383,8 +1461,9 @@ and update every MCP entry that referenced the old path.
 
 | Path | Purpose |
 |---|---|
-| `~/.config/opencode/opencode.json` | providers, models + limits, MCPs, plugins, compaction |
+| `~/.config/opencode/opencode.json` | providers, models + limits, MCPs, plugins, compaction, permission |
 | `~/.config/opencode/AGENTS.md` | global policy: graph rules, caveman, shell hygiene, REA ban |
+| `~/.config/opencode/get-shit-done/` | superpowers framework: gsd-* agents, templates, workflows, `gsd-tools.cjs` |
 | `~/.config/opencode/plugins/rtk.ts` | RTK plugin **plus the after-tool compression hook** |
 | `~/.config/opencode/plugins/rea-guard/index.ts` | REA model guard |
 | `~/.config/opencode/plugins/rea-guard/package.json` | plugin manifest |
@@ -1631,7 +1710,7 @@ does not include the fnm-managed Node bin directory.
 **Fix.** Absolute paths in every MCP `command`:
 
 ```json
-"command": ["/Users/<you>/.local/share/fnm/node-versions/24.22.3/installation/bin/rea", "mcp"]
+"command": ["/Users/<you>/.local/share/fnm/node-versions/v24.22.3/installation/bin/rea", "mcp"]
 ```
 
 Re-resolve after any Node upgrade — fnm changes the version segment.
