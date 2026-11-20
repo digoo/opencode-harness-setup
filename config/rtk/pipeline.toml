@@ -1,0 +1,15 @@
+# RTK pipeline for the agent-side compression hooks.
+#
+# Without this file the daemon logs:
+#   no cache-breakpoint or CCR rules — running category-A normalisation only
+# and `rtk-proxy stats` reports tokens saved: 0.
+#
+# rtk:posthook adds the hook.after_tool rules (term, lockfile, json, matches, web).
+# rtk:proxy adds the proxy.request rules (cache-align).
+#
+# Install to: ~/Library/Application Support/rtk/pipeline.toml
+
+schema_version = 1
+
+[pipeline]
+extends = ["rtk:posthook", "rtk:proxy"]

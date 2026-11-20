@@ -1,0 +1,30 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "ANTHROPIC_API_KEY": "<replace with your key>",
+    "ANTHROPIC_MODEL": "claude-opus-5-5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-2",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-5-5",
+    "CLAUDE_CODE_EFFORT_LEVEL": "auto",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "262144",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144",
+    "ENABLE_TOOL_SEARCH": "true"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "rtk hook claude" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Read|Grep|Glob|WebFetch|WebSearch",
+        "hooks": [{ "type": "command", "command": "rtk hook claude" }]
+      }
+    ]
+  }
+}

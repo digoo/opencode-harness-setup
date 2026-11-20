@@ -1,0 +1,8 @@
+.DS_Store
+*.log
+secrets/
+*.key
+config/rtk/rtk-proxy.toml
+
+# Local agent state
+.serena/
