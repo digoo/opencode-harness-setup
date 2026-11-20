@@ -9,6 +9,11 @@ diagnostics, and the settings that turned out to be load-bearing.
 
 **Target**: macOS 26.7.1 (arm64) · OpenCode 2.3.2 · Node 24.22.3 (fnm) · Homebrew 7.0.10
 
+> **Custom API URL.** Every example uses `https://api.example.com/v1` as the upstream provider
+> endpoint. Replace it with your own OpenAI-compatible API base URL throughout. It appears in
+> the `rtk-proxy.toml` upstreams, the `rtk-proxy service install` flags, the `RTK_PROXY_*`
+> environment variables, and the OpenCode provider `baseURL`.
+
 ---
 
 ## Table of contents
@@ -42,7 +47,7 @@ OpenCode (GPT or Claude model)
 rtk-proxy  :8080          normalize (ANSI/progress/dedup) + cache-align
     |
     v
-https://api.kpalabz.com/v1        (the provider)
+https://api.example.com/v1        (the provider)
 
 Claude Code
     |
@@ -53,7 +58,7 @@ Headroom  :8787            Kompress ONNX, mode=cache, tool-result interceptors
 rtk-proxy  :8080
     |
     v
-https://api.kpalabz.com/v1
+https://api.example.com/v1
 ```
 
 Both proxies are **launchd user agents**, so they start at login and survive the editor closing.
@@ -157,8 +162,8 @@ The file `~/Library/Application Support/rtk-proxy/rtk-proxy.toml` contains:
 
 ```toml
 bind = "127.0.0.1:8080"
-anthropic_upstream = "https://api.kpalabz.com/v1"
-openai_upstream = "https://api.kpalabz.com/v1"
+anthropic_upstream = "https://api.example.com/v1"
+openai_upstream = "https://api.example.com/v1"
 ccr = true
 cache_align = true
 normalize = true
@@ -183,8 +188,8 @@ upstream_retries = 2
 > Environment variables work when starting the process:
 >
 > ```sh
-> RTK_PROXY_OPENAI_UPSTREAM=https://api.kpalabz.com/v1 \
-> RTK_PROXY_ANTHROPIC_UPSTREAM=https://api.kpalabz.com/v1 \
+> RTK_PROXY_OPENAI_UPSTREAM=https://api.example.com/v1 \
+> RTK_PROXY_ANTHROPIC_UPSTREAM=https://api.example.com/v1 \
 >   rtk llm-proxy start
 > ```
 
@@ -192,8 +197,8 @@ upstream_retries = 2
 
 ```sh
 rtk-proxy service install \
-  --openai-upstream https://api.kpalabz.com/v1 \
-  --anthropic-upstream https://api.kpalabz.com/v1 \
+  --openai-upstream https://api.example.com/v1 \
+  --anthropic-upstream https://api.example.com/v1 \
   --ccr true --cache-align true --compression balanced
 ```
 
@@ -454,7 +459,7 @@ curl -s http://127.0.0.1:8787/v1/chat/completions -H "Authorization: Bearer $KEY
         "gpt-5-6-luna": {
           "name": "GPT-5.6 Luna",
           "settings": {
-            "apiKey": "{file:~/.config/opencode/secrets/kpalabz-gpt.key}"
+            "apiKey": "{file:~/.config/opencode/secrets/provider-gpt.key}"
           },
           "limit": { "context": 1050000, "input": 922000, "output": 128000 }
         }
@@ -494,15 +499,15 @@ for (const [p,m] of Object.entries(d)) {
 ```sh
 mkdir -p ~/.config/opencode/secrets
 chmod 700 ~/.config/opencode/secrets
-printf '%s' 'sk-...' > ~/.config/opencode/secrets/kpalabz-gpt.key
-printf '%s' 'sk-...' > ~/.config/opencode/secrets/kpalabz-claude.key
+printf '%s' 'sk-...' > ~/.config/opencode/secrets/provider-gpt.key
+printf '%s' 'sk-...' > ~/.config/opencode/secrets/provider-claude.key
 chmod 600 ~/.config/opencode/secrets/*.key
 ```
 
 Reference with `{file:...}` so the key never appears in the config file:
 
 ```json
-"apiKey": "{file:~/.config/opencode/secrets/kpalabz-gpt.key}"
+"apiKey": "{file:~/.config/opencode/secrets/provider-gpt.key}"
 ```
 
 ---
@@ -551,7 +556,7 @@ rtk init --show
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
-    "ANTHROPIC_API_KEY": "<kpalabz claude key>",
+    "ANTHROPIC_API_KEY": "<your provider key>",
     "ANTHROPIC_MODEL": "claude-opus-5-5",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5",
@@ -1167,7 +1172,7 @@ Expected chain output:
 
 ```text
 http://127.0.0.1:8080
-https://api.kpalabz.com/v1
+https://api.example.com/v1
 ```
 
 Expected savings on a busy machine:
