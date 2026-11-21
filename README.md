@@ -312,10 +312,13 @@ headroom doctor
 
 Expected: `kompress │ ✓ pass │ ready (onnx)`.
 
-> On first request the ONNX model downloads and warms in the background. The log shows
+> On first request the ONNX model is loaded on a background thread. The log shows
 > `Kompress: DEFERRED (warming in the background after startup)` followed by
-> `Kompress: warmed in the background in 4577 ms (backend onnx)`. A `degraded` kompress
-> status during that window is expected, not a fault.
+> `Kompress: warmed in the background in N ms (backend onnx)`.
+>
+> Un-tuned on an 8-core arm64 Mac this took **58,861 ms**. With the ONNX tuning in
+> [5.7](#57-speed-up-the-kompress-warm-up) it takes **~10,000 ms**. A `degraded` kompress
+> status during the warm window is expected, not a fault.
 
 ### 5.2 Install as a service
 
@@ -361,9 +364,14 @@ And the manifest must match, because **`base_env` overrides the run script**. Ed
 ```json
 {
   "ANTHROPIC_TARGET_API_URL": "http://127.0.0.1:8080",
-  "OPENAI_TARGET_API_URL": "http://127.0.0.1:8080/v1"
+  "OPENAI_TARGET_API_URL": "http://127.0.0.1:8080/v1",
+  "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS": "8",
+  "HEADROOM_KOMPRESS_ONNX_INTER_THREADS": "2",
+  "HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS": "0"
 }
 ```
+
+The last three are the ONNX warm-up tuning — see [5.7](#57-speed-up-the-kompress-warm-up).
 
 Restart and verify the upstream actually changed:
 
@@ -512,6 +520,64 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY
   -d @body.json | jq .usage.prompt_tokens     # without Headroom
 curl -s http://127.0.0.1:8787/v1/chat/completions -H "Authorization: Bearer $KEY" \
   -d @body.json | jq .usage.prompt_tokens     # with Headroom
+```
+
+### 5.7 Speed up the Kompress warm-up
+
+The one-time cost is ONNX Runtime creating the session for the 261MB `kompress-v2-base`
+int8-wo model. ORT's defaults are conservative, so on Apple Silicon it does the work on
+far fewer cores than the machine has.
+
+Three environment variables fix it. Add them to the run script **and** the manifest
+`base_env` (see [5.3](#53-point-headroom-at-rtk-proxy) for why both are needed):
+
+```bash
+# Use all cores for the model's internal work
+export HEADROOM_KOMPRESS_ONNX_INTRA_THREADS=8
+export HEADROOM_KOMPRESS_ONNX_INTER_THREADS=2
+# Start the background warm-up immediately instead of after a 2s delay
+export HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS=0
+```
+
+Measured on this machine, same model, same backend:
+
+| | Warm time |
+|---|---|
+| Default | 58,861 ms |
+| Tuned | **10,159 ms** (5.8x) |
+
+**Why `inter` is 2 and not 8.** `HEADROOM_KOMPRESS_MAX_CONCURRENT` defaults to `1` for
+ONNX backends — the upstream source comment says "ONNX already owns its intra/inter-op
+threads". So only one model invocation runs at a time and `intra=8` cannot oversubscribe.
+But `intra=8` **and** `inter=8` would give ORT up to 64 threads on 8 cores. `inter=2`
+leaves headroom without giving up the parallel-op win.
+
+**Do not enable `HEADROOM_ONNX_ALLOW_SPINNING=1`** unless you want this. It restores ORT's
+spin-waiting threads, which the upstream docs explicitly warn against for a long-lived
+proxy:
+
+> ORT's thread pools spin-wait on every core between inferences by default, so a
+> long-lived proxy that keeps compression/embedding models loaded pegs all cores even
+> while completely idle — the machine slows to a crawl after a while (#2495).
+
+That is a bad trade for a proxy that runs 24/7 via launchd on a laptop you also use for
+everything else. It would not speed up the warm-up either — spinning affects the gap
+between inferences, not session creation.
+
+Verify the model is loaded:
+
+```sh
+curl -s http://127.0.0.1:8787/debug/warmup | grep -o '"kompress":{"status":"[a-z]*"'
+# {"kompress":{"status":"loaded"
+```
+
+After changing any of these, restart the launchd agent and watch the log:
+
+```sh
+launchctl bootout gui/$(id -u)/com.headroom.default
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.headroom.default.plist
+sleep 15
+grep 'Kompress: warmed' ~/.headroom/deploy/default/runner.log | tail -n 1
 ```
 
 ---
@@ -1502,10 +1568,11 @@ and update every MCP entry that referenced the old path.
 
 | Metric | Value |
 |---|---|
-| RTK overall savings | 19.6K tokens (38.0%) |
+| RTK overall savings | 34.4K tokens (29.6%) |
 | RTK after-hook on a 51KB result | 51,374 to 16,108 bytes (69%) |
 | Headroom savings (OpenCode) | 11,019 tokens over 36 calls |
 | Headroom on large Bash output | ~15% |
+| Kompress warm-up (tuned) | 10,159 ms (was 58,861 ms) |
 | REA tools available | 255 (plus 6 prompts) |
 
 ---
@@ -1846,6 +1913,70 @@ gh repo clone OWNER/REPO ./local-dir
 gh api "repos/OWNER/REPO/git/trees/main?recursive=1" --jq '.tree[].path'
 ```
 
+### 16.17 `verify.sh` reported failures that were not real
+
+**Symptom.** The verification script printed:
+
+```text
+  FAIL rea-guard not loaded
+  FAIL rtk not loaded
+```
+
+while `opencode plugin list` plainly showed both plugins loaded.
+
+**Cause.** `grep -q` exits the moment it finds a match. The upstream command in the pipe
+then receives `SIGPIPE` and dies. Under `set -o pipefail` the pipeline's status becomes
+that failure, so a *successful* match reported as a *failed* check.
+
+The same bug made one check pass for the wrong reason — the MCP check used
+`grep -q "failed"`, which does not match, so `grep` exited 1 and the `|| ok` branch ran.
+It was reporting "all connected" because the string was absent, not because it was present.
+
+**Fix.** Capture into a variable, then match in the shell — no pipe involved:
+
+```bash
+has() { [[ "$1" == *"$2"* ]]; }
+
+plugin_out=$(opencode plugin list 2>&1)
+has "$plugin_out" "rea-guard" && ok "rea-guard loaded" || bad "rea-guard not loaded"
+```
+
+**Detection.** A check that fails while the underlying command clearly succeeds is a
+script bug, not a system bug. Verify the command by hand before touching the system.
+
+### 16.18 Kompress took 59 seconds to warm
+
+**Symptom.** After every headroom restart, the first request through the proxy stalled.
+The log showed:
+
+```text
+Kompress: DEFERRED (warming in the background after startup)
+...
+Kompress: warmed in the background in 58861 ms (backend onnx)
+```
+
+**Cause.** ONNX Runtime's default thread pool settings are conservative. On an 8-core
+arm64 Mac it built the session for the 261MB int8-wo model using a fraction of the
+available cores.
+
+**Fix.** Three environment variables, in both the run script and the manifest `base_env`:
+
+```bash
+export HEADROOM_KOMPRESS_ONNX_INTRA_THREADS=8
+export HEADROOM_KOMPRESS_ONNX_INTER_THREADS=2
+export HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS=0
+```
+
+Result: **58,861 ms → 10,159 ms**.
+
+**Trap.** The env var names are `HEADROOM_KOMPRESS_ONNX_*`, not `KOMPRESS_ONNX_*`. The
+latter silently does nothing — `_env_int` returns `None` for an unset variable and the
+session options are left at ORT's defaults.
+
+**Trap.** `HEADROOM_ONNX_ALLOW_SPINNING=1` looks like a performance win and is not. It
+makes ORT's idle threads spin-wait, pegging every core while the proxy sits idle. It does
+not affect session creation, so it does not help the warm-up either.
+
 ---
 
 ## 17. Complete issue index
@@ -1868,6 +1999,8 @@ gh api "repos/OWNER/REPO/git/trees/main?recursive=1" --jq '.tree[].path'
 | 14 | Model capped at 200k | no `limit` declared | declare per model | [16.14](#1614-provider-limits-were-silently-capped) |
 | 15 | Plugin edit ignored | server caches plugins | `/reload` or `--standalone` | [16.15](#1615-the-plugin-was-edited-but-the-running-server-kept-the-old-code) |
 | 16 | GitHub calls drifting to curl | no standing rule | `gh` for everything | [16.16](#1616-gh-was-not-the-only-path-to-github) |
+| 17 | verify.sh false failures | `grep -q` + `pipefail` = SIGPIPE | capture to a var, match in bash | [16.17](#1617-verifysh-reported-failures-that-were-not-real) |
+| 18 | Kompress warm takes 59s | ORT default thread pool is conservative | 3 ONNX env vars -> 10s | [16.18](#1618-kompress-took-59-seconds-to-warm) |
 
 ---
 
